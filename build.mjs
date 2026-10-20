@@ -15,7 +15,7 @@ import { fileURLToPath } from "node:url";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const VERSION = "1.3.1";
-const loaderUrl = process.argv[2] || "https://pastebin.com/raw/jWDq3mmF";
+const loaderUrl = process.argv[2] || "https://update.greasyfork.org/scripts/600256/1966644/MooMoo-js.js";
 
 const src = fs.readFileSync(path.join(here, "src", "moomod.js"), "utf8");
 
