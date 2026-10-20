@@ -1,0 +1,1213 @@
+// ==UserScript==
+// @name         MooMod
+// @namespace    moomoo.js
+// @version      1.3.1
+// @description  MooMoo.io mod: instakill, biome auto-gear, click hats, legit auto heal, place spammers, arrows, reload bars, minimap. Press the menu key (default O).
+// @author       al007ex
+// @match        *://*/*
+// @run-at       document-start
+// @inject-into  page
+// @require      https://pastebin.com/raw/jWDq3mmF?v=1.3.1
+// @grant        none
+// ==/UserScript==
+//
+// This @requires the loader above. Tampermonkey caches @require files; the ?v=
+// part makes it refetch when the loader is updated. Edit @match to your server's
+// origin if you want to scope it to one site.
+
+/*
+ * MooMod — a small, friendly mod on the moomoo.js API.
+ * ==============================================================
+ * Everything it does is ADDITIVE: it never takes over the client's own movement,
+ * aim or attacking, so it drops in next to normal play (and is a tidy worked
+ * example of the public `ctx` API: place / eat / setHat / input / store / combat).
+ *
+ *   place spammers   hold a key to keep placing an item (spike / trap / turret or
+ *                    teleporter / windmill). each one's key, item and speed are
+ *                    customizable.
+ *   auto heal        eats when you drop below a threshold, with an optional "legit"
+ *                    mode: heal a bit lower, show the food in hand for a moment
+ *                    first, and jitter the timing so it doesn't look robotic.
+ *   hat hotkeys      bind keys to equip (toggle) a hat by id.
+ *   its own menu      opens on a key (default O), styled like the game's own boxes.
+ *
+ * Config is edited entirely from the menu and persisted through the loader's hidden
+ * store (MooMooLoader.config) — no localStorage key of its own.
+ */
+
+(function () {
+    "use strict";
+
+    function boot(MooMoo, MooMooLoader) {
+        MooMoo.register({
+            id: "moomoo-lite",
+            name: "MooMod",
+            version: "1.0.0",
+            description: "Place spammers, legit auto heal and hat hotkeys. Press the menu key (default O).",
+            menu: true,
+            menuHint: "Open MooMod's menu with its key (default O) to set everything up.",
+            liveSettings: true,
+            defaultEnabled: true
+        }, function (ctx) {
+            const win = (typeof unsafeWindow !== "undefined") ? unsafeWindow : window;
+            const doc = (win.document && win.document.createElement) ? win.document : null;
+            const data = ctx.data;
+            const self = () => MooMoo.self;
+            // hat catalog + icons (served at /img/hats/hat_<id>.png)
+            const HAT_BY_ID = {};
+            for (const h of (data.hats || [])) HAT_BY_ID[h.id] = h;
+            const hatImg = (id) => "/img/hats/hat_" + id + ".png";
+            const hatName = (id) => !id ? "None" : (HAT_BY_ID[id] ? HAT_BY_ID[id].name : "Hat " + id);
+            // accessory ("tail") catalog + icons (served at /img/accessories/access_<id>.png)
+            const ACC_BY_ID = {};
+            for (const a of (data.accessories || [])) ACC_BY_ID[a.id] = a;
+            const accImg = (id) => "/img/accessories/access_" + id + ".png";
+            const accName = (id) => !id ? "None" : (ACC_BY_ID[id] ? ACC_BY_ID[id].name : "Acc " + id);
+
+            // ---- config ----
+            // The four spammers are fixed jobs; their key / item / speed / on are yours.
+            const SPAMMERS = [
+                { id: "spike", label: "Spike", key: "v", item: "spikes", speed: 111 },
+                { id: "trap", label: "Trap / Boost pad", key: "f", item: "trap|booster", speed: 111 },
+                { id: "turret", label: "Turret / Teleporter", key: "t", item: "utility", speed: 150 },
+                { id: "windmill", label: "Windmill", key: "n", item: "mill", speed: 150 }
+            ];
+            const DEFAULTS = {
+                menuKey: "o",
+                spammers: {},
+                heal: { on: true, healAt: 70, legit: true, showInHand: 90, jitter: 40, maxPerSec: 6, shameSafe: true },
+                humanize: { on: true, jitter: 25, pauseChance: 8, pauseMax: 350 },
+                // reverse: shoot the secondary weapon first, then the primary (the normal
+                // insta is primary then secondary). autoAim always aims at the closest enemy.
+                insta: { key: "r", mode: "packet", swapDelay: 100, switchBack: true, autoAim: true, reverse: false, primaryHat: 7, secondaryHat: 53, primaryAcc: 0, secondaryAcc: 0 },
+                // hold a mouse button to wear a hat + accessory. left = primary, right = secondary.
+                clicks: {
+                    left: { on: false, hat: 7, acc: 0 },
+                    right: { on: false, hat: 40, acc: 0 }
+                },
+                // auto GG: send a custom chat message each time you get a kill
+                autogg: { on: false, message: "gg" },
+                // biome gear: auto-swap your hat to match the biome you're standing in
+                // (snow -> Winter Cap, river -> Flipper, everywhere else -> Booster).
+                biomegear: { on: false, snow: 15, normal: 12, river: 31 },
+                // on-screen arrows ringing your player, pointing at others: enemies red,
+                // teammates green, animals blue, all at a fixed distance from you.
+                arrows: { on: true, players: true, animals: true, offscreen: true, radius: 110, size: 15 },
+                // two reload bars under every player's health bar (primary + secondary cooldown)
+                reloads: { on: true, self: true, enemies: true },
+                // running count of each item you've placed, shown on its action-bar icon
+                counter: { on: true },
+                // minimap overlay: your placed buildings (their action-bar icons) +
+                // resource dots + biome bands, with a full-screen map on a key.
+                minimap: { on: true, items: true, trees: true, bushes: true, stones: true, gold: true, biomes: true, key: "m" },
+                hats: [{ key: "", id: 7 }, { key: "", id: 6 }, { key: "", id: 40 }, { key: "", id: 11 }, { key: "", id: 0 }, { key: "", id: 0 }]
+            };
+            for (const s of SPAMMERS) DEFAULTS.spammers[s.id] = { key: s.key, item: s.item, speed: s.speed, on: true };
+
+            // Config is kept in the loader's hidden store (no localStorage key of our
+            // own for an integrity probe to find — the loader wipes it from localStorage
+            // during play and writes it back only as the page unloads).
+            const cfgStore = (MooMooLoader && MooMooLoader.config) || null;
+            const prefs = JSON.parse(JSON.stringify(DEFAULTS));
+            try {
+                const got = cfgStore ? cfgStore.get("lite") : null;
+                if (got && typeof got === "object") {
+                    if (typeof got.menuKey === "string" && got.menuKey) prefs.menuKey = got.menuKey;
+                    if (got.heal && typeof got.heal === "object") Object.assign(prefs.heal, got.heal);
+                    if (got.humanize && typeof got.humanize === "object") Object.assign(prefs.humanize, got.humanize);
+                    if (got.insta && typeof got.insta === "object") Object.assign(prefs.insta, got.insta);
+                    if (got.autogg && typeof got.autogg === "object") Object.assign(prefs.autogg, got.autogg);
+                    if (got.clicks && typeof got.clicks === "object") {
+                        if (got.clicks.left) Object.assign(prefs.clicks.left, got.clicks.left);
+                        if (got.clicks.right) Object.assign(prefs.clicks.right, got.clicks.right);
+                    }
+                    if (got.arrows && typeof got.arrows === "object") Object.assign(prefs.arrows, got.arrows);
+                    if (got.reloads && typeof got.reloads === "object") Object.assign(prefs.reloads, got.reloads);
+                    if (got.counter && typeof got.counter === "object") Object.assign(prefs.counter, got.counter);
+                    if (got.minimap && typeof got.minimap === "object") Object.assign(prefs.minimap, got.minimap);
+                    if (got.biomegear && typeof got.biomegear === "object") Object.assign(prefs.biomegear, got.biomegear);
+                    if (Array.isArray(got.hats)) got.hats.forEach((h, i) => { if (prefs.hats[i] && h) Object.assign(prefs.hats[i], h); });
+                    if (got.spammers) for (const s of SPAMMERS) if (got.spammers[s.id]) Object.assign(prefs.spammers[s.id], got.spammers[s.id]);
+                    if (prefs.spammers.trap.item === "trap") prefs.spammers.trap.item = "trap|booster";   // old saves
+                }
+            } catch (e) { /* defaults */ }
+            const save = () => { try { if (cfgStore) cfgStore.set("lite", prefs); } catch (e) {} };
+
+            // ---- keys ----
+            const keyId = (e) => (e.key === " " ? "Space" : e.key);
+            const keyLabel = (id) => !id ? "—" : id === "Space" ? "Space" : id.length === 1 ? id.toUpperCase() : id;
+            const same = (a, b) => !!a && !!b && a.toLowerCase() === b.toLowerCase();
+            function typing() {
+                const a = doc && doc.activeElement;
+                if (!a || a === doc.body) return false;
+                if (a.isContentEditable || a.tagName === "TEXTAREA") return true;
+                return a.tagName === "INPUT" && /^(text|search|number|password|email|url|tel|)$/i.test(a.type || "");
+            }
+
+            // ---- resolve the item to place ----
+            // "utility" = whatever age-7+ building is in your bar (turret / teleporter / ...).
+            const UTILITY = ["turret", "platform", "healing pad", "spawn pad", "blocker", "teleporter"];
+            // "a|b" = first of those you have (trap|booster -> pit trap or boost pad).
+            function resolveItem(which) {
+                const bar = (self().items) || [];
+                // numeric id: only if you actually own it. Selecting an item you
+                // don't have is ignored by the server (no strike), and the real
+                // client never sends one, so refuse to resolve to it.
+                if (typeof which === "number") return bar.indexOf(which) >= 0 ? which : -1;
+                if (which.includes("|")) {
+                    for (const w of which.split("|")) { const id = resolveItem(w.trim()); if (id >= 0) return id; }
+                    return -1;
+                }
+                if (which === "utility") {
+                    for (const id of bar) { const it = data.item(id); if (it && UTILITY.includes(it.name)) return id; }
+                    return -1;
+                }
+                // the bar item whose item-name or group-name matches (covers tiered items).
+                // No itemByName fallback: that could name an item you haven't
+                // upgraded to, which the server would silently ignore.
+                for (const id of bar) { const it = data.item(id); if (it && (it.name === which || (it.group && it.group.name === which))) return id; }
+                return -1;
+            }
+            // place toward the cursor, falling back to your facing
+            const placeDir = () => (ctx.input ? ctx.input.aimAngle() : (self().dir || 0));
+
+            // ---- place spammers ----
+            // Humanized spacing: a bell-shaped jitter around the base interval plus the
+            // odd longer hesitation, so placements don't land on a fixed clock that a
+            // packet-timing check could flag as a script. (off -> the plain fixed speed.)
+            function nextDelay(cfg) {
+                const base = Math.max(40, cfg.speed | 0);
+                const h = prefs.humanize;
+                if (!h || !h.on) return base;
+                // sum of three uniforms ~ a bell centered on 0.5 (central limit): most gaps
+                // sit near the base and the extremes are rare, like a person's rhythm.
+                const g = (Math.random() + Math.random() + Math.random()) / 3;
+                let d = base * (1 + (g - 0.5) * 2 * ((h.jitter | 0) / 100));
+                // every so often, hold a little longer (a glance away, a reaction)
+                if (Math.random() * 100 < (h.pauseChance | 0)) d += Math.random() * (h.pauseMax | 0);
+                return Math.max(40, Math.round(d));
+            }
+
+            const timers = {};   // spammer id -> timeout id
+            function startSpam(s) {
+                if (timers[s.id]) return;
+                const cfg = prefs.spammers[s.id];
+                const loop = () => {
+                    if (prefs.spammers[s.id].on && self() && self().alive) {
+                        const id = resolveItem(cfg.item);
+                        if (id >= 0) ctx.place(id, placeDir());
+                    }
+                    timers[s.id] = win.setTimeout(loop, nextDelay(cfg));
+                };
+                loop();
+            }
+            function stopSpam(id) { if (timers[id]) { win.clearTimeout(timers[id]); timers[id] = 0; } }
+            ctx.onCleanup(() => { for (const id in timers) stopSpam(id); });
+
+            // ---- auto heal ----
+            let healTimer = 0, lastHealAt = 0;
+            function tryHeal() {
+                const h = prefs.heal, me = self();
+                if (!h.on || healTimer || !me || !me.alive) return;
+                if (me.health == null || me.health >= 100 || me.health > h.healAt) return;
+                const gap = 1000 / Math.max(1, h.maxPerSec | 0);
+                if (Date.now() - lastHealAt < gap) return;
+                lastHealAt = Date.now();
+                const food = (me.items && me.items[0] != null) ? me.items[0] : 0;
+                if (!(me.items && me.items.indexOf(food) >= 0)) return;   // never select a food you don't own
+                if (!h.legit) { ctx.eat(food); return; }
+                // legit: show the food in hand, then eat after a human-ish delay
+                MooMoo.send.selectItem(food, false);
+                let wait = (h.showInHand | 0) + Math.random() * (h.jitter | 0);
+                if (h.shameSafe && ctx.combat && ctx.combat.shameWait) wait = Math.max(wait, ctx.combat.shameWait());
+                healTimer = win.setTimeout(() => {
+                    healTimer = 0;
+                    if (!self() || !self().alive) return;
+                    MooMoo.send.mouse(true, self().dir || 0);                 // eat
+                    MooMoo.send.selectItem(self().weaponIndex, true);          // back to the weapon
+                }, wait);
+            }
+            ctx.on("health", (p) => { if (p.sid === self().sid) tryHeal(); });
+            ctx.every(100, tryHeal);
+            ctx.onCleanup(() => { if (healTimer) win.clearTimeout(healTimer); });
+
+            // ---- auto GG: send a custom chat message when you get a kill. The server tells the
+            // killer "N kills <count>" (only the killer gets it), so a rising count = a fresh kill.
+            let lastKills = 0, lastGG = 0;
+            ctx.on("playerValue", (p) => {
+                if (!p || p.key !== "kills") return;
+                const v = p.value | 0, prev = lastKills; lastKills = v;
+                if (v <= prev) return;                      // reset / resync, not a new kill
+                if (!prefs.autogg.on) return;
+                const msg = (prefs.autogg.message || "").trim(); if (!msg) return;
+                const now = Date.now(); if (now - lastGG < 900) return;   // don't spam on multi-kills
+                lastGG = now;
+                try { MooMoo.send.chat({ message: msg.slice(0, 48) }); } catch (e) {}
+            });
+            ctx.on("died", () => { lastKills = 0; });        // kills reset each life
+
+            // ---- hat hotkeys ----
+            function hatKey(h) {
+                const me = self();
+                if (!me || !me.alive) return;                 // the server ignores store packets while you're dead
+                if (!h.id) { ctx.setHat(0); return; }         // explicit "take it off" (always valid)
+                if (ctx.store && ctx.store.hat === h.id) { ctx.setHat(0); return; }   // toggle: already on -> off
+                if (ctx.store && ctx.store.ownsHat && !ctx.store.ownsHat(h.id)) return;  // never equip a hat you don't own
+                ctx.setHat(h.id);
+            }
+
+            // ---- instakill combo ----
+            // Two hits: primary (in the primary hat) then secondary (in the secondary hat).
+            // "Confirmed" (packet) mode swaps to the secondary only once the server echoes
+            // the first swing ("K"), so the primary lands before the weapon changes; "Timed"
+            // mode swaps after a fixed delay. Auto-aim points each hit at the nearest enemy.
+            // Everything goes out as ordinary packets through the rate governor.
+            let instaBusy = false;
+            function waitForOwnSwing(cb, timeoutMs) {
+                let done = false, unsub = null;
+                const finish = () => { if (done) return; done = true; if (unsub) { try { unsub(); } catch (e) {} } cb(); };
+                unsub = ctx.on("gatherAnimation", (pk) => {
+                    const a = pk && pk.args, me = self();
+                    if (a && me && a[0] === me.sid) finish();   // our own swing was registered
+                });
+                ctx.after(Math.max(60, timeoutMs | 0), finish);  // fallback (out of range / ranged primary)
+            }
+            function runInsta() {
+                const cfg = prefs.insta, me = self();
+                if (instaBusy || !me || !me.alive) return;
+                const weapons = me.weapons || [];
+                const primary = weapons[0];
+                const secondary = weapons[1];
+                if (primary == null) return;
+                instaBusy = true;
+                const prevHat = (ctx.store && ctx.store.hat) || 0;   // restore it after the combo
+                const prevAcc = (ctx.store && ctx.store.tail) || 0;  // the accessory you were wearing (0 = none)
+                let touchedAcc = false;
+                const ownsHat = (id) => !(ctx.store && ctx.store.ownsHat) || ctx.store.ownsHat(id);
+                const ownsAcc = (id) => !(ctx.store && ctx.store.ownsTail) || ctx.store.ownsTail(id);
+                const equipCombo = (hatId, accId) => {
+                    if (hatId && ownsHat(hatId)) ctx.setHat(hatId);                 // a slot's hat (0 = leave as is)
+                    if (accId && ctx.setTail && ownsAcc(accId)) { ctx.setTail(accId); touchedAcc = true; }  // + its accessory
+                };
+                // Always aim at the CLOSEST visible enemy. We use the combat engine's own
+                // enemy list (ctx.combat.vn, sorted nearest-first by the PREDICTED x2/y2 the
+                // game actually renders) and its angle helper, so the shot points where the
+                // target is drawn — not at the stale server-tick position MooMoo.players holds.
+                const aimDir = () => {
+                    const fb = (ctx.input && ctx.input.aimAngle) ? ctx.input.aimAngle() : (self().dir || 0);
+                    if (!cfg.autoAim) return fb;
+                    const C = ctx.combat;
+                    if (C && C.z && C.vn && C.vn.length && C.B) return C.B(C.z, C.vn[0]);   // nearest enemy, render-space angle
+                    if (ctx.nearestEnemy) { const en = ctx.nearestEnemy(); if (en) return ctx.angleTo(self(), en); }  // fallback
+                    return fb;
+                };
+                const fire = (weaponId, hatId, accId) => {
+                    if (!self() || !self().alive) return false;
+                    equipCombo(hatId, accId);                          // c (equip hat + accessory)
+                    if (weaponId != null) MooMoo.send.selectItem(weaponId, true);   // z (weapon)
+                    MooMoo.send.mouse(true, aimDir());                 // F down -> queues one swing, aims at the closest enemy
+                    return true;
+                };
+                // which weapon fires first / second. reverse = secondary then primary.
+                const altW = secondary != null ? secondary : primary;
+                const firstW = cfg.reverse ? altW : primary, firstHat = cfg.reverse ? cfg.secondaryHat : cfg.primaryHat, firstAcc = cfg.reverse ? cfg.secondaryAcc : cfg.primaryAcc;
+                const secondW = cfg.reverse ? primary : altW, secondHat = cfg.reverse ? cfg.primaryHat : cfg.secondaryHat, secondAcc = cfg.reverse ? cfg.primaryAcc : cfg.secondaryAcc;
+                const finish = () => {
+                    MooMoo.send.mouse(false);
+                    if (cfg.switchBack && primary != null && self() && self().alive) MooMoo.send.selectItem(primary, true);
+                    ctx.setHat(prevHat);                               // back to the hat you had on
+                    if (touchedAcc && ctx.setTail) ctx.setTail(prevAcc);  // and the accessory you had (0 = none)
+                    instaBusy = false;
+                };
+                const END_HOLD = 160;                                  // hold briefly so the second shot goes out
+                const secondAndEnd = () => {
+                    if (!self() || !self().alive) { finish(); return; }
+                    fire(secondW, secondHat, secondAcc);               // second shot (also aims at the closest enemy)
+                    ctx.after(END_HOLD, finish);
+                };
+                if (!fire(firstW, firstHat, firstAcc)) { instaBusy = false; return; }
+                if (cfg.mode === "packet") waitForOwnSwing(secondAndEnd, 350);
+                else ctx.after(Math.max(40, cfg.swapDelay | 0), secondAndEnd);
+            }
+
+            // ---- the one key listener (capture, so it beats the client's own keys) ----
+            // It only ever acts on keys YOU bound here; everything else passes straight
+            // through to the game, so movement / attacking are untouched.
+            const held = new Set();
+            function onKeyDown(e) {
+                if (e.isTrusted === false) return;
+                // while binding, capture ANY key (doGrab decides: Esc clears, modifiers wait)
+                if (grab) { e.preventDefault(); e.stopImmediatePropagation(); doGrab(e); return; }
+                // Escape closes the hat picker
+                if (e.key === "Escape" && doc) { const pk = doc.querySelector(".mml-pick"); if (pk) { e.preventDefault(); e.stopImmediatePropagation(); pk.remove(); return; } }
+                if (e.key === "Escape" && bigOpen) { e.preventDefault(); e.stopImmediatePropagation(); bigOpen = false; return; }
+                if (typing() || e.ctrlKey || e.metaKey || e.altKey) return;
+                const id = keyId(e);
+                if (same(id, prefs.menuKey)) { e.preventDefault(); e.stopImmediatePropagation(); if (!e.repeat) toggleMenu(); return; }
+                if (prefs.minimap.on && !open && same(id, prefs.minimap.key)) { e.preventDefault(); e.stopImmediatePropagation(); if (!e.repeat) toggleBigMap(); return; }
+                if (same(id, prefs.insta.key)) { e.preventDefault(); e.stopImmediatePropagation(); if (!e.repeat) runInsta(); return; }
+                for (const s of SPAMMERS) {
+                    const cfg = prefs.spammers[s.id];
+                    if (cfg.on && same(id, cfg.key)) { e.preventDefault(); e.stopImmediatePropagation(); if (!e.repeat && !held.has(s.id)) { held.add(s.id); startSpam(s); } return; }
+                }
+                for (const h of prefs.hats) {
+                    if (h.key && same(id, h.key)) { e.preventDefault(); e.stopImmediatePropagation(); if (!e.repeat) hatKey(h); return; }
+                }
+            }
+            function onKeyUp(e) {
+                const id = keyId(e);
+                for (const s of SPAMMERS) if (same(id, prefs.spammers[s.id].key)) { held.delete(s.id); stopSpam(s.id); }
+            }
+            if (doc) {
+                win.addEventListener("keydown", onKeyDown, true);
+                win.addEventListener("keyup", onKeyUp, true);
+                win.addEventListener("blur", () => { for (const s of SPAMMERS) { held.delete(s.id); stopSpam(s.id); } });
+                ctx.onCleanup(() => { win.removeEventListener("keydown", onKeyDown, true); win.removeEventListener("keyup", onKeyUp, true); });
+            }
+
+            // ---- hold a mouse button to wear a hat + accessory ----
+            // Hold a configured button and it wears that button's combo; let go and it
+            // puts back whatever you had on. left = primary combo, right = secondary.
+            // Purely additive — the client still does the actual aiming and attacking.
+            const mouse = { prevHat: 0, prevAcc: 0, curHat: 0, curAcc: 0, active: null, order: [], gen: 0 };
+            const clickCfg = (btn) => btn === 2 ? prefs.clicks.right : prefs.clicks.left;
+            const canHat = (id) => !id || !(ctx.store && ctx.store.ownsHat) || ctx.store.ownsHat(id);
+            const canAcc = (id) => !id || !(ctx.store && ctx.store.ownsTail) || ctx.store.ownsTail(id);
+            // put on a combo. 0 in a slot leaves that slot as it is (so a reload hat can
+            // swap while the accessory stays). dedupes, so an unchanged slot sends nothing.
+            function put(hat, acc) {
+                if (hat && hat !== mouse.curHat && canHat(hat) && ctx.setHat) { ctx.setHat(hat); mouse.curHat = hat; }
+                if (acc && acc !== mouse.curAcc && canAcc(acc) && ctx.setTail) { ctx.setTail(acc); mouse.curAcc = acc; }
+            }
+            // put the loadout you had before the first press back on (bare slots included).
+            function restorePrev() {
+                if (mouse.prevHat !== mouse.curHat && canHat(mouse.prevHat) && ctx.setHat) ctx.setHat(mouse.prevHat | 0);
+                if (mouse.prevAcc !== mouse.curAcc && canAcc(mouse.prevAcc) && ctx.setTail) ctx.setTail(mouse.prevAcc | 0);
+                mouse.curHat = mouse.prevHat; mouse.curAcc = mouse.prevAcc;
+            }
+            function wearActive() { if (mouse.active != null) { const c = clickCfg(mouse.active); put(c.hat, c.acc); } }
+            function setActive(btn) { mouse.active = btn; mouse.gen++; wearActive(); }   // gen++ voids any pending reload swap
+            function pressButton(btn) {
+                if (mouse.order.indexOf(btn) >= 0) return;
+                if (!mouse.order.length) {
+                    mouse.prevHat = mouse.curHat = (ctx.store && ctx.store.hat) || 0;
+                    mouse.prevAcc = mouse.curAcc = (ctx.store && ctx.store.tail) || 0;
+                }
+                mouse.order.push(btn);
+                setActive(btn);
+            }
+            function releaseButton(btn) {
+                const i = mouse.order.indexOf(btn);
+                if (i < 0) return;
+                mouse.order.splice(i, 1);
+                mouse.gen++;
+                if (!mouse.order.length) { mouse.active = null; restorePrev(); }
+                else setActive(mouse.order[mouse.order.length - 1]);
+            }
+            function releaseAll() { if (mouse.order.length) { mouse.order.length = 0; mouse.active = null; mouse.gen++; restorePrev(); } }
+            function onMouseDown(e) {
+                if (e.isTrusted === false || open) return;
+                // only real in-game clicks (the game canvas, or the touch-input overlay when it's
+                // shown) — never the menu, store/hat shop, action bar or any other UI element
+                const tid = e.target && e.target.id;
+                if (!tid || (tid !== "gameCanvas" && tid.indexOf("touch-controls") !== 0)) return;
+                if (e.button !== 0 && e.button !== 2) return;
+                if (!clickCfg(e.button).on) return;
+                const me = self(); if (!me || !me.alive) return;
+                pressButton(e.button);
+            }
+            function onMouseUp(e) { if (e.button === 0 || e.button === 2) releaseButton(e.button); }
+            if (doc) {
+                win.addEventListener("mousedown", onMouseDown, true);
+                win.addEventListener("mouseup", onMouseUp, true);
+                win.addEventListener("blur", releaseAll);
+                ctx.onCleanup(() => { win.removeEventListener("mousedown", onMouseDown, true); win.removeEventListener("mouseup", onMouseUp, true); win.removeEventListener("blur", releaseAll); });
+            }
+
+            // ---- biome gear: auto-swap your hat to match the biome you're standing in ----
+            // snow -> a cold hat (Winter Cap), the central river -> Flipper, everywhere else
+            // (grass + desert) -> your "normal" hat (Booster). Fires only when you cross INTO a
+            // new biome, so within a biome your hat keys / insta / click-hats stay in charge;
+            // it also waits while the insta or a click-hat is momentarily driving your hat, so
+            // it never fights them. Each hat id is configurable; 0 in a slot = leave the hat be.
+            const BG_MAPSCALE = (ctx.combat && ctx.combat.K && ctx.combat.K.mapScale) || 14400;
+            const BG_SNOW = 2400, BG_RIVER_HALF = 724 / 2, BG_RIVER_MID = BG_MAPSCALE / 2;
+            function biomeAt(y) {
+                if (y == null || isNaN(y)) return null;
+                if (y < BG_SNOW) return "snow";
+                if (y >= BG_RIVER_MID - BG_RIVER_HALF && y <= BG_RIVER_MID + BG_RIVER_HALF) return "river";
+                return "normal";
+            }
+            let bgBiome = null;
+            function biomeGearTick() {
+                const bg = prefs.biomegear;
+                if (!bg || !bg.on) { bgBiome = null; return; }
+                const me = self(); if (!me || !me.alive) return;
+                const q = ctx.combat && ctx.combat.Hg && ctx.combat.Hg(me.sid);
+                const y = q ? (q.y2 != null ? q.y2 : q.y) : me.y;   // predicted position the game renders
+                const b = biomeAt(y);
+                if (b == null || b === bgBiome) return;             // same biome -> leave the hat alone
+                if (instaBusy || mouse.active != null) return;      // a combat feature owns the hat now; retry next tick
+                bgBiome = b;
+                const want = b === "snow" ? bg.snow : b === "river" ? bg.river : bg.normal;
+                if (want && (!(ctx.store && ctx.store.ownsHat) || ctx.store.ownsHat(want)) && ctx.setHat) ctx.setHat(want);
+            }
+            ctx.every(150, biomeGearTick);
+
+            // ---- player / animal arrows (a fixed-distance ring that points at others) ----
+            // Drawn on the loader's transparent overlay (ctx.render.layer), in screen space
+            // so every arrow sits the same distance from you. Enemies red, teammates green,
+            // animals blue. Additive only — nothing the stock client draws is touched.
+            const ARROW = { enemy: "#ff4747", teammate: "#49d170", animal: "#3ea6ff" };
+            // A minimal, see-through CHEVRON pointing outward at the entity (two thin arms
+            // meeting at the tip) — colour-coded (enemy red, teammate green, animal blue).
+            // Just one translucent stroke: no halo, no gloss, nothing to clutter the screen.
+            function arrowAt(g, cx, cy, ang, color, size) {
+                const x = cx + prefs.arrows.radius * Math.cos(ang), y = cy + prefs.arrows.radius * Math.sin(ang);
+                const tip = size * 0.7, back = -size * 0.5, spread = size * 0.72;
+                g.save();
+                g.translate(x, y);
+                g.rotate(ang);                                 // point outward, toward the entity
+                g.lineJoin = "round"; g.lineCap = "round";
+                g.globalAlpha = 0.72;
+                g.lineWidth = Math.max(2, size * 0.24);
+                g.strokeStyle = color;
+                g.beginPath();
+                g.moveTo(back, -spread);
+                g.lineTo(tip, 0);
+                g.lineTo(back, spread);
+                g.stroke();
+                g.restore();
+            }
+            function drawArrows(g, view) {
+                const a = prefs.arrows;
+                if (!a.on || !ctx.render) return;
+                const me = ctx.render.me;
+                if (!me || !me.visible) return;
+                const myTeam = (MooMoo.self && MooMoo.self.team != null) ? MooMoo.self.team : null;
+                const c = ctx.render.worldToScreen(me.x, me.y);
+                const W = win.innerWidth || 1920, H = win.innerHeight || 1080;
+                const onScreen = (p) => { const s = ctx.render.worldToScreen(p.x, p.y); return s.x >= 0 && s.x <= W && s.y >= 0 && s.y <= H; };
+                g.save();
+                g.setTransform(view.dpr, 0, 0, view.dpr, 0, 0);    // CSS px -> device px (fixed screen distance)
+                if (a.players) {
+                    for (const [sid, p] of ctx.render.players) {
+                        if (!p.visible || p === me) continue;
+                        if (a.offscreen && onScreen(p)) continue;
+                        const gp = MooMoo.player && MooMoo.player(sid);
+                        const team = gp && gp.team != null ? gp.team : null;
+                        const col = (team != null && team === myTeam) ? ARROW.teammate : ARROW.enemy;
+                        arrowAt(g, c.x, c.y, Math.atan2(p.y - me.y, p.x - me.x), col, a.size);
+                    }
+                }
+                if (a.animals) {
+                    for (const an of ctx.render.animals.values()) {
+                        if (!an.visible) continue;
+                        if (a.offscreen && onScreen(an)) continue;
+                        arrowAt(g, c.x, c.y, Math.atan2(an.y - me.y, an.x - me.x), ARROW.animal, a.size);
+                    }
+                }
+                g.restore();
+            }
+            let arrowsLayer = null;
+            function applyArrows() {
+                if (!ctx.render || !ctx.render.layer) return;
+                if (prefs.arrows.on && !arrowsLayer) arrowsLayer = ctx.render.layer("mml-arrows", drawArrows, { z: 60 });
+                else if (!prefs.arrows.on && arrowsLayer) { try { arrowsLayer(); } catch (e) {} arrowsLayer = null; }
+            }
+            applyArrows();
+
+            // ---- reload bars: two bars under each player's health bar (primary +
+            // secondary weapon cooldown). Drawn on the loader's overlay in the SAME
+            // world-aligned space the game draws the health bar, with the game's exact
+            // geometry, so they sit right under the health bar and move with the player.
+            // The value comes from the loader's combat engine, which mirrors the client's
+            // native reload exactly: it fills ONLY the currently-selected weapon (so swapping
+            // to your other weapon PAUSES this one until you swap back), resets the primary on
+            // a melee swing and the SECONDARY on a projectile shot (so bows / crossbows move
+            // too). We smooth that per-tick value between frames with the weapon's known reload
+            // speed, so it stays smooth at any frame rate.
+            const RL = { bg: "#3d3f42", primary: "#58c0ff", secondary: "#ffc24a" };
+            const HW = 50, PAD = 4.5, NAMEY = 34, HBH = 17, BARH = 17, GAP = 3;   // game health-bar geometry (world units); reload bars match its height
+            const rdisp = new Map();   // sid -> per-weapon smoothing state
+            ctx.every(5000, () => { for (const sid of rdisp.keys()) if (!ctx.render || !ctx.render.players.has(sid)) rdisp.delete(sid); });
+            // The combat engine advances a reload value (0..1) ONCE per server tick (~111ms),
+            // so drawing it raw is choppy. We smooth it without drift: anchor to the engine
+            // value and the wall-clock time it last changed, then show anchor + elapsed/dur.
+            // The extrapolation rate equals the engine's per-tick step, so each new tick
+            // re-anchors seamlessly (no accumulation, no jitter). Only the SELECTED weapon
+            // fills, so swapping away freezes the bar where it is (the game's own behaviour);
+            // a drop back toward 0 is a fresh shot and restarts the cycle. Shown value is
+            // monotonic within a cycle, so a late server tick never kicks the bar backwards.
+            function smoothWeapon(s, k, eng, filling, dur, now) {
+                const a = s[k] || (s[k] = { eng: eng, t: now, shown: eng, fill: filling });
+                const reset = eng < a.eng - 0.05;                        // a fresh shot dropped the value
+                if (eng !== a.eng || (filling && !a.fill)) { a.eng = eng; a.t = now; }  // re-anchor on change / when fill resumes
+                a.fill = filling;
+                const shown = (filling && dur > 0) ? Math.min(1, eng + (now - a.t) / dur) : eng;
+                a.shown = reset ? shown : Math.max(a.shown, Math.min(1, shown));
+                return a.shown;
+            }
+            function reloadState(sid, now) {
+                let s = rdisp.get(sid); if (!s) { s = {}; rdisp.set(sid, s); }
+                const q = ctx.combat && ctx.combat.Hg && ctx.combat.Hg(sid);
+                if (!q) return { p: 1, s: 1 };
+                const ep = q.pr == null ? 1 : q.pr, es = q.sr == null ? 1 : q.sr, wi = q.weaponIndex | 0;
+                const pw = data.weapon(q.primary), sw = data.weapon(q.secondary);
+                const pdur = (pw && pw.speed) ? pw.speed * (q.samRP || 1) : 0;
+                const sdur = (sw && sw.speed) ? sw.speed * (q.samRS || 1) : 0;
+                return {
+                    p: smoothWeapon(s, "p", ep, wi <= 8 && ep < 1 && pdur > 0, pdur, now),
+                    s: smoothWeapon(s, "s", es, wi > 8 && es < 1 && sdur > 0, sdur, now)
+                };
+            }
+            function barRect(g, x, y, w, h, r) { if (w <= 0) return; g.beginPath(); if (g.roundRect) g.roundRect(x, y, w, h, r); else g.rect(x, y, w, h); g.fill(); }
+            const FULLW = HW * 2 + PAD * 2;         // the health bar's width (world units)
+            const HALFW = (FULLW - GAP) / 2;        // each reload bar: half the health bar, side by side
+            // same look as the game's health bar: a #3d3f42 round-rect (r 8), then the fill
+            // inset by healthBarPad with r 7 (no stroke — the dark inset is the "outline").
+            function drawBar(g, x, y, w, prog, color) {
+                g.fillStyle = RL.bg; barRect(g, x, y, w, BARH, 8);
+                g.fillStyle = color; barRect(g, x + PAD, y + PAD, (w - PAD * 2) * Math.max(0, Math.min(1, prog)), BARH - PAD * 2, 7);
+            }
+            function drawReloads(g, view) {
+                if (!prefs.reloads.on || !ctx.render) return;
+                const now = view.now || Date.now(), left = view.left, top = view.top, me = MooMoo.self;
+                g.globalAlpha = 1; g.lineJoin = "round";
+                for (const [sid, p] of ctx.render.players) {
+                    if (!p.visible) continue;
+                    const isSelf = !!(me && sid === me.sid);
+                    if (isSelf ? !prefs.reloads.self : !prefs.reloads.enemies) continue;
+                    const r = reloadState(sid, now);
+                    const lx = (p.x - left) - (HW + PAD);   // same left edge as the health bar
+                    const y0 = (p.y - top) + (p.scale || 35) + NAMEY + HBH + GAP;
+                    drawBar(g, lx, y0, HALFW, r.p, RL.primary);                 // primary (left half)
+                    drawBar(g, lx + HALFW + GAP, y0, HALFW, r.s, RL.secondary);  // secondary (right half)
+                }
+            }
+            let reloadsLayer = null;
+            function applyReloads() {
+                if (!ctx.render || !ctx.render.layer) return;
+                if (prefs.reloads.on && !reloadsLayer) reloadsLayer = ctx.render.layer("mml-reloads", drawReloads, { z: 55 });
+                else if (!prefs.reloads.on && reloadsLayer) { try { reloadsLayer(); } catch (e) {} reloadsLayer = null; }
+            }
+            applyReloads();
+
+            // ---- item placement counter: a white count in the top-right of each placeable
+            // item's action-bar icon. The server already reports your per-group placed count
+            // (the "S" packet); we keep the running TOTAL (sum of its increases), so it never
+            // drops when a build is destroyed. The badge is a class-only element with no id,
+            // so an integrity probe scanning id'd elements never sees it.
+            const placed = {}, lastCnt = {};
+            const NW = (data.weapons || []).length;   // weapons take the first action-bar slots
+            ctx.on("itemCount", (pk) => {
+                const a = pk && pk.args; if (!a) return;
+                const g = a[0], c = a[1] | 0, prev = lastCnt[g] || 0;
+                if (c > prev) placed[g] = (placed[g] || 0) + (c - prev);
+                lastCnt[g] = c;
+            });
+            function slotBadge(slot) {
+                let b = slot.querySelector(".mml-cnt");
+                if (!b) {
+                    try { if (win.getComputedStyle(slot).position === "static") slot.style.position = "relative"; } catch (e) { slot.style.position = "relative"; }
+                    b = doc.createElement("div"); b.className = "mml-cnt";
+                    b.style.cssText = "position:absolute;top:0;right:4px;color:#fff;font-family:'Hammersmith One',sans-serif;font-size:15px;line-height:1.1;-webkit-text-stroke:2.5px #000;paint-order:stroke fill;text-shadow:0 1px 1px rgba(0,0,0,.45);pointer-events:none;z-index:2";
+                    slot.appendChild(b);
+                }
+                return b;
+            }
+            function updateCounter() {
+                if (!doc) return;
+                const items = data.items || [];
+                for (let k = 0; k < items.length; k++) {
+                    const slot = doc.getElementById("actionBarItem" + (NW + k));
+                    if (!slot) continue;
+                    const grp = items[k].group, g = grp == null ? null : (typeof grp === "object" ? grp.id : grp);
+                    const n = (prefs.counter.on && slot.style.display !== "none" && g != null) ? (placed[g] || 0) : 0;
+                    if (n > 0) { const b = slotBadge(slot); b.textContent = n; b.style.display = ""; }
+                    else { const b = slot.querySelector(".mml-cnt"); if (b) b.style.display = "none"; }
+                }
+            }
+            if (doc) {
+                ctx.every(150, updateCounter);
+                ctx.onCleanup(() => { try { const bs = doc.querySelectorAll(".mml-cnt"); for (let i = 0; i < bs.length; i++) bs[i].remove(); } catch (e) {} });
+            }
+
+            // ---- minimap: your placed buildings (shown as their action-bar icons) +
+            // resource dots + biome bands, painted over the game's minimap, with a full-
+            // screen map on a key. We use our OWN overlay canvas (no id, pointer-events
+            // none) stacked above the game UI — the game repaints #mapDisplay every frame,
+            // and the loader's world overlay sits below the UI, so neither can host this.
+            // The canvas carries no id, so an integrity probe scanning id'd elements never
+            // sees it; object positions come from the world the engine already tracks.
+            const TAU = Math.PI * 2;
+            const MAPSCALE = (ctx.combat && ctx.combat.K && ctx.combat.K.mapScale) || 14400;
+            const SNOWY = 2400, RIVERW = 724;     // clone biome bands (world units)
+            const BIOME = { grass: "#b6db66", snow: "#ffffff", desert: "#dbc666", river: "#91b2db" };  // the clone's own colours
+            const BIOME_A = 0.45;   // biome bands are a translucent overlay over the base map
+            const DOT = { tree: "#3f8f2e", bush: "#cf4b4b", stone: "#9aa0a6", gold: "#e8c24a" };
+            const marks = new Map();   // sid -> { x, y, kind, id }
+            function kindOf(o) {
+                if (o.isItem) return "item";
+                if (o.type === 0) return "tree"; if (o.type === 1) return "bush";
+                if (o.type === 2) return "stone"; if (o.type === 3) return "gold";
+                return null;
+            }
+            function pollMap() {
+                if (!prefs.minimap.on || !ctx.objects || !ctx.objects.all) return;
+                const me = MooMoo.self, mySid = me ? me.sid : null;
+                const list = ctx.objects.all(), live = new Set();
+                for (let i = 0; i < list.length; i++) {
+                    const o = list[i]; live.add(o.sid);
+                    if (marks.has(o.sid)) continue;
+                    const k = kindOf(o); if (!k) continue;
+                    if (k === "item" && !(mySid != null && o.ownerSid === mySid)) continue;   // only your own buildings
+                    marks.set(o.sid, { x: o.x, y: o.y, kind: k, id: o.id });
+                }
+                for (const [sid, m] of marks) if (m.kind === "item" && !live.has(sid)) marks.delete(sid);   // drop destroyed buildings
+            }
+            ctx.every(500, pollMap);
+
+            // an item's icon = the game's own action-bar slot art. The slot renders the icon
+            // as a CSS background-image data-URL; we read it, load it into an off-DOM Image
+            // (never appended — no network, no footprint) and cache a small canvas of it.
+            const iconCache = new Map();   // id -> { src, cv, ready }
+            function slotArt(id) {
+                const slot = doc.getElementById("actionBarItem" + (NW + id));
+                if (!slot) return null;
+                const bg = slot.style.backgroundImage;
+                if (bg && bg !== "none") { const m = /url\(["']?(.*?)["']?\)/.exec(bg); if (m) return { url: m[1] }; }
+                const cv = slot.querySelector("canvas"); if (cv && cv.width) return { canvas: cv };
+                const im = slot.querySelector("img"); if (im && im.src) return { url: im.src };
+                return null;
+            }
+            function itemIcon(id) {
+                if (id == null || !doc) return null;
+                const got = slotArt(id); let e = iconCache.get(id);
+                if (!got) return e && e.ready ? e.cv : null;
+                if (got.canvas) {   // a live canvas: recopy periodically
+                    const now = Date.now();
+                    if (e && e.src === "#canvas" && now - e.t < 1500) return e.cv;
+                    const cv = (e && e.cv) || doc.createElement("canvas"); cv.width = 36; cv.height = 36;
+                    try { const g2 = cv.getContext("2d"); g2.clearRect(0, 0, 36, 36); g2.drawImage(got.canvas, 0, 0, 36, 36); } catch (err) { return e ? e.cv : null; }
+                    iconCache.set(id, { src: "#canvas", cv, ready: true, t: now }); return cv;
+                }
+                if (e && e.src === got.url) return e.ready ? e.cv : null;   // already loading/loaded this art
+                const cv = doc.createElement("canvas"); cv.width = 36; cv.height = 36;
+                const rec = { src: got.url, cv, ready: false };
+                const img = new Image();
+                img.onload = () => { try { const g2 = cv.getContext("2d"); g2.clearRect(0, 0, 36, 36); g2.drawImage(img, 0, 0, 36, 36); rec.ready = true; } catch (err) {} };
+                img.src = got.url;
+                iconCache.set(id, rec);
+                return null;
+            }
+
+            // shared renderer: biomes, then markers, then your position, inside a square
+            // of side `size` at (mx,my). world (0..MAPSCALE) maps linearly onto that square.
+            function drawMap(g, mx, my, size, big) {
+                const cfg = prefs.minimap, f = size / MAPSCALE;
+                if (big || cfg.biomes) { g.fillStyle = BIOME.grass; g.fillRect(mx, my, size, size); }   // base map (grass)
+                if (cfg.biomes) {
+                    g.globalAlpha = BIOME_A;   // translucent overlay so the base + markers still read through
+                    g.fillStyle = BIOME.snow;   g.fillRect(mx, my, size, SNOWY * f);
+                    g.fillStyle = BIOME.desert; g.fillRect(mx, my + (MAPSCALE - SNOWY) * f, size, size - (MAPSCALE - SNOWY) * f);
+                    g.fillStyle = BIOME.river;  g.fillRect(mx, my + (MAPSCALE / 2 - RIVERW / 2) * f, size, RIVERW * f);
+                    g.globalAlpha = 1;
+                }
+                const dot = big ? 4 : 1.7, icon = big ? 16 : 6.5;
+                for (const m of marks.values()) {
+                    const on = m.kind === "item" ? cfg.items : m.kind === "tree" ? cfg.trees : m.kind === "bush" ? cfg.bushes : m.kind === "stone" ? cfg.stones : m.kind === "gold" ? cfg.gold : false;
+                    if (!on) continue;
+                    const px = mx + m.x * f, py = my + m.y * f;
+                    if (m.kind === "item") {
+                        const cv = itemIcon(m.id);
+                        if (cv) g.drawImage(cv, px - icon / 2, py - icon / 2, icon, icon);
+                        else { g.fillStyle = "#f2f4f7"; g.fillRect(px - icon * 0.35, py - icon * 0.35, icon * 0.7, icon * 0.7); }
+                    } else { g.beginPath(); g.fillStyle = DOT[m.kind]; g.arc(px, py, dot, 0, TAU); g.fill(); }
+                }
+                const meR = (ctx.render && ctx.render.me) || MooMoo.self;
+                if (meR && meR.x != null) {
+                    const px = mx + meR.x * f, py = my + meR.y * f;
+                    g.beginPath(); g.fillStyle = "#ffffff"; g.arc(px, py, big ? 5 : 2.6, 0, TAU); g.fill();
+                    g.lineWidth = big ? 2 : 1.3; g.strokeStyle = "#1a1c22"; g.stroke();
+                }
+            }
+            function drawBig(g, W, H) {
+                g.globalAlpha = 0.5; g.fillStyle = "#0b0e14"; g.fillRect(0, 0, W, H); g.globalAlpha = 1;
+                const side = Math.min(W, H) * 0.84, mx = (W - side) / 2, my = (H - side) / 2;
+                g.save(); g.beginPath(); g.rect(mx, my, side, side); g.clip();
+                drawMap(g, mx, my, side, true);
+                g.restore();
+                g.lineWidth = 3; g.strokeStyle = "#3d3f42"; g.strokeRect(mx, my, side, side);
+                g.fillStyle = "#eceef2"; g.font = "15px 'Hammersmith One',sans-serif"; g.textAlign = "center"; g.textBaseline = "bottom";
+                g.fillText("Map — " + keyLabel(prefs.minimap.key) + " to close", W / 2, my - 8);
+            }
+
+            let bigOpen = false;
+            function toggleBigMap() { bigOpen = !bigOpen; }
+            let mapCv = null, mapG = null;
+            function ensureCanvas() {
+                if (mapCv || !doc || !doc.body) return mapCv;   // body may not exist at boot
+                mapCv = doc.createElement("canvas");
+                mapCv.style.cssText = "position:fixed;left:0;top:0;pointer-events:none;z-index:9000;display:none";
+                doc.body.appendChild(mapCv);
+                mapG = mapCv.getContext("2d");
+                return mapCv;
+            }
+            function paintMap(view) {
+                if (!ensureCanvas()) return;
+                const live = view && view.inGame, big = bigOpen && live;
+                if ((!prefs.minimap.on || !live) && !big) { if (mapCv.style.display !== "none") mapCv.style.display = "none"; return; }
+                let rx, ry, rw, rh;
+                if (big) { rx = 0; ry = 0; rw = win.innerWidth || view.width; rh = win.innerHeight || view.height; }
+                else {
+                    const md = doc && doc.getElementById("mapDisplay");
+                    const r = md && md.getBoundingClientRect();
+                    if (!r || r.width < 8) { if (mapCv.style.display !== "none") mapCv.style.display = "none"; return; }
+                    rx = r.left; ry = r.top; rw = r.width; rh = r.height;
+                }
+                const dpr = (view && view.dpr) || win.devicePixelRatio || 1;
+                const W = Math.max(1, Math.round(rw * dpr)), H = Math.max(1, Math.round(rh * dpr));
+                if (mapCv.width !== W || mapCv.height !== H) { mapCv.width = W; mapCv.height = H; }
+                mapCv.style.left = rx + "px"; mapCv.style.top = ry + "px"; mapCv.style.width = rw + "px"; mapCv.style.height = rh + "px";
+                mapCv.style.display = "block";
+                mapG.setTransform(dpr, 0, 0, dpr, 0, 0);
+                mapG.clearRect(0, 0, rw, rh);
+                mapG.lineJoin = "round";
+                if (big) drawBig(mapG, rw, rh);
+                else drawMap(mapG, 0, 0, rw, false);
+            }
+            if (ctx.render && ctx.render.onFrame) {
+                ctx.render.onFrame(paintMap);
+                ctx.onCleanup(() => { try { if (mapCv) mapCv.remove(); } catch (e) {} });
+            }
+
+            // =================================================================
+            // MENU — a dark, moomoo-styled client panel (sidebar + module cards).
+            // =================================================================
+            const FONT = '"Hammersmith One", sans-serif';
+            const SANS = 'system-ui,-apple-system,"Segoe UI",Roboto,sans-serif';
+            const CSS = `
+            .mml-gui{position:fixed;inset:0;z-index:99990;display:none;background:rgba(9,11,16,.5);font-family:${FONT};-webkit-user-select:none;user-select:none;
+              --acc:#8ecc51;--side:#13151b;--panel:#1b1e26;--ctrl:#ffffff12;--track:#ffffff1c;--text:#eceef2;--sub:#aab0bd;--muted:#6f7684;--border:#2a2e38}
+            .mml-gui.open{display:block}
+            .mml-panel{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);display:flex;width:720px;max-width:94vw;height:522px;max-height:88vh;background:var(--panel);border-radius:16px;overflow:hidden;color:var(--text);box-shadow:0 22px 64px rgba(0,0,0,.55);font-size:14px}
+            .mml-panel .side{flex:0 0 178px;background:var(--side);display:flex;flex-direction:column;padding:14px 10px}
+            .mml-panel .brand{display:flex;align-items:center;gap:9px;padding:6px 8px 15px}
+            .mml-panel .bname{font-size:17px;font-weight:600;letter-spacing:.3px;color:var(--text)}
+            .mml-panel .nav{flex:1 1 auto;display:flex;flex-direction:column;gap:3px;overflow-y:auto}
+            .mml-panel .navitem{display:flex;align-items:center;gap:11px;padding:10px 11px;border-radius:9px;color:var(--sub);cursor:pointer;transition:background .12s,color .12s}
+            .mml-panel .navitem:hover{background:#1d2029;color:var(--text)}
+            .mml-panel .navitem.active{background:#242834;color:var(--text)}
+            .mml-panel .ntxt{font-size:14px}
+            .mml-panel .user{display:flex;align-items:center;gap:9px;padding:11px 7px 2px;margin-top:8px;border-top:1px solid var(--border)}
+            .mml-panel .uinfo{display:flex;flex-direction:column;min-width:0}
+            .mml-panel .uname{font-size:13px;color:var(--text)}
+            .mml-panel .uver{font-size:11px;color:var(--muted);font-family:${SANS}}
+            .mml-panel .body{flex:1 1 auto;display:flex;flex-direction:column;min-width:0}
+            .mml-panel .head{display:flex;align-items:center;justify-content:space-between;padding:13px 18px;border-bottom:1px solid var(--border)}
+            .mml-panel .htitle{font-size:17px;color:var(--text)}
+            .mml-panel .close{color:var(--muted);cursor:pointer;font-size:15px;padding:5px 9px;border-radius:8px}
+            .mml-panel .close:hover{color:var(--text);background:#242834}
+            /* content: no boxes, no outlines, no scrollbar. modules are plain blocks
+               grouped by a quiet title — settings sit directly on the panel. */
+            .mml-panel .content{flex:1 1 auto;overflow-y:auto;overflow-x:hidden;scrollbar-width:none;padding:6px 18px 14px}
+            .mml-panel .content::-webkit-scrollbar{width:0;height:0}
+            .mml-panel .modgrid{display:grid;grid-template-columns:1fr 1fr;gap:4px 22px;align-items:start}
+            .mml-panel .mod{padding:7px 0 2px;min-width:0}
+            .mml-panel .mod.wide{grid-column:1/-1}
+            .mml-panel .modhead{display:flex;align-items:center;justify-content:space-between;min-height:24px}
+            .mml-panel .modtitle{font-size:11px;letter-spacing:.5px;text-transform:uppercase;color:var(--muted)}
+            .mml-panel .modbody{padding:1px 0 0}
+            .mml-panel .row{display:flex;align-items:center;gap:10px;min-height:25px}
+            .mml-panel .rl{font-size:13px;color:var(--sub);font-family:${SANS}}
+            .mml-panel .row:not(.srow) .rl{flex:1 1 auto;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+            .mml-panel .srow .rl{flex:0 0 72px}
+            .mml-panel .sw{flex:0 0 auto;width:32px;height:18px;border-radius:9px;background:var(--track);position:relative;cursor:pointer;transition:background .16s}
+            .mml-panel .sw.on{background:var(--acc)}
+            .mml-panel .sw::after{content:"";position:absolute;top:2.5px;left:2.5px;width:13px;height:13px;border-radius:50%;background:#fff;transition:left .16s}
+            .mml-panel .sw.on::after{left:16.5px}
+            .mml-panel .rng{-webkit-appearance:none;flex:1 1 auto;min-width:40px;height:4px;border-radius:2px;background:var(--track);outline:none;cursor:pointer}
+            .mml-panel .rng::-webkit-slider-thumb{-webkit-appearance:none;width:13px;height:13px;border-radius:50%;background:#fff;cursor:pointer}
+            .mml-panel .rng::-moz-range-thumb{width:13px;height:13px;border:none;border-radius:50%;background:#fff;cursor:pointer}
+            .mml-panel .rngval{flex:0 0 auto;min-width:40px;text-align:right;font-size:12px;color:var(--text);font-family:${SANS}}
+            .mml-panel .kb{flex:0 0 auto;min-width:28px;text-align:center;padding:3px 9px;border-radius:5px;background:var(--ctrl);color:var(--sub);font-size:12px;cursor:pointer;font-family:${SANS}}
+            .mml-panel .kb:hover{color:var(--text)}
+            .mml-panel .kb.grab{color:var(--acc)}
+            .mml-panel .txt{flex:0 1 auto;width:88px;min-width:0;padding:3px 8px;border-radius:5px;background:var(--ctrl);border:none;color:var(--text);font-family:${SANS};font-size:12px;text-align:center;outline:none}
+            .mml-panel .selwrap{position:relative;flex:0 0 auto}
+            .mml-panel .sel{appearance:none;-webkit-appearance:none;padding:3px 24px 3px 9px;border-radius:5px;background:var(--ctrl);border:none;color:var(--text);font-family:${SANS};font-size:12px;cursor:pointer;outline:none}
+            .mml-panel .sel option{background:#23262f;color:var(--text)}
+            .mml-panel .selwrap::after{content:"";position:absolute;right:9px;top:45%;width:6px;height:6px;border-right:2px solid var(--sub);border-bottom:2px solid var(--sub);transform:translateY(-50%) rotate(45deg);pointer-events:none}
+            .mml-panel .hatrow{display:flex;flex-wrap:wrap;gap:8px;padding:3px 0 2px}
+            .mml-panel .hatcell{display:flex;flex-direction:column;align-items:center;gap:3px}
+            .mml-panel .accpair{display:flex;gap:5px}
+            .mml-panel .hatbox{width:40px;height:40px;display:flex;align-items:center;justify-content:center;border-radius:6px;background:var(--ctrl);cursor:pointer}
+            .mml-panel .hatbox img{width:30px;height:30px;object-fit:contain}
+            .mml-panel .hatph{color:var(--muted);font-size:16px}
+            .mml-panel .hatcap{font-size:11px;color:var(--muted);font-family:${SANS}}
+            .mml-panel .btn{margin-top:6px;text-align:center;padding:5px;border-radius:6px;background:var(--ctrl);color:var(--sub);cursor:pointer;font-size:12.5px;font-family:${SANS}}
+            .mml-panel .btn:hover{color:var(--text)}
+            .mml-pick{position:fixed;inset:0;z-index:99992;display:flex;align-items:center;justify-content:center;background:rgba(9,11,16,.62);font-family:${FONT}}
+            .mml-pick .pickpanel{width:420px;max-width:92vw;max-height:70vh;overflow-y:auto;scrollbar-width:none;padding:14px;border-radius:12px;background:#1b1e26;box-shadow:0 22px 64px rgba(0,0,0,.6);color:#eceef2}
+            .mml-pick .pickpanel::-webkit-scrollbar{width:0}
+            .mml-pick .picktitle{text-align:center;font-size:16px;margin-bottom:11px}
+            .mml-pick .pickgrid{display:flex;flex-wrap:wrap;gap:7px;justify-content:center}
+            .mml-pick .ptile{box-sizing:border-box;width:60px;height:68px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;padding:4px;border-radius:8px;background:#ffffff10;border:2px solid transparent;cursor:pointer}
+            .mml-pick .ptile:hover{background:#ffffff1f}
+            .mml-pick .ptile.sel{border-color:#8ecc51}
+            .mml-pick .ptile img{width:40px;height:40px;object-fit:contain}
+            .mml-pick .pcap{font-size:10px;color:#9aa0aa;max-width:54px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-family:${SANS}}
+            .mml-pick .pnone{font-size:12px;color:#6f7684}
+            `;
+            let gui = null, built = false, open = false, grab = null, grabEl = null;
+            let activeCat = "placement", headTitle = null, contentEl = null;
+
+            function mk(tag, cls, text) { const n = doc.createElement(tag); if (cls) n.className = cls; if (text != null) n.textContent = text; return n; }
+
+            // ---- components ----
+            function toggleSwitch(get, set) {
+                const sw = mk("div", "sw");
+                const paint = () => sw.classList.toggle("on", !!get());
+                sw.addEventListener("click", (e) => { e.stopPropagation(); set(!get()); save(); paint(); });
+                paint(); return sw;
+            }
+            function bindBtn(get, set) {
+                const b = mk("div", "kb");
+                const paint = () => { if (grabEl !== b) { b.classList.remove("grab"); b.textContent = keyLabel(get()); } };
+                b.addEventListener("click", () => { b.classList.add("grab"); b.textContent = "…"; grab = (id) => { set(id); save(); paint(); }; grabEl = b; });
+                paint(); b._paint = paint; return b;
+            }
+            function smoothSlider(min, max, step, get, set, fmt) {
+                const r = mk("input", "rng"); r.type = "range"; r.min = min; r.max = max; r.step = step; r.value = get();
+                const val = mk("span", "rngval");
+                const paint = () => {
+                    const p = max > min ? ((+r.value - min) / (max - min)) * 100 : 0;
+                    r.style.background = "linear-gradient(to right, var(--acc) " + p + "%, var(--track) " + p + "%)";
+                    val.textContent = (fmt || String)(+r.value);
+                };
+                r.addEventListener("input", paint);
+                r.addEventListener("change", () => { set(+r.value); save(); });
+                paint();
+                return { input: r, val };
+            }
+            function textInput(get, set, cls) {
+                const i = mk("input", "txt" + (cls ? " " + cls : "")); i.type = "text"; i.value = get();
+                i.addEventListener("change", () => { set(i.value.trim()); save(); });
+                i.addEventListener("keydown", (e) => { e.stopPropagation(); if (e.key === "Enter") i.blur(); });
+                return i;
+            }
+            function selectBox(options, get, set) {
+                const wrap = mk("div", "selwrap");
+                const sel = mk("select", "sel");
+                for (const o of options) { const op = mk("option"); op.value = o.value; op.textContent = o.label; sel.appendChild(op); }
+                sel.value = get();
+                sel.addEventListener("change", () => { set(sel.value); save(); });
+                sel.addEventListener("keydown", (e) => e.stopPropagation());
+                wrap.appendChild(sel); return wrap;
+            }
+            // a slot renders a hat (kind omitted) or an accessory (kind === "acc")
+            const slotImg = (kind, id) => kind === "acc" ? accImg(id) : hatImg(id);
+            const slotName = (kind, id) => kind === "acc" ? accName(id) : hatName(id);
+            const slotList = (kind) => (kind === "acc" ? data.accessories : data.hats) || [];
+            function hatSlot(get, set, kind) {
+                const box = mk("div", "hatbox");
+                const paint = () => {
+                    box.textContent = "";
+                    const id = get();
+                    if (id) { const img = mk("img"); img.src = slotImg(kind, id); img.alt = slotName(kind, id); img.onerror = () => { img.replaceWith(mk("div", "hatph", "—")); }; box.appendChild(img); }
+                    else box.appendChild(mk("div", "hatph", "+"));
+                    box.title = slotName(kind, id);
+                };
+                box.addEventListener("click", () => openHatPicker(get(), (id) => { set(id); save(); paint(); }, kind));
+                paint(); return box;
+            }
+            function openHatPicker(cur, onPick, kind) {
+                if (!gui) return;
+                const old = gui.querySelector(".mml-pick"); if (old) old.remove();
+                const pick = mk("div", "mml-pick");
+                const panel = mk("div", "pickpanel");
+                panel.appendChild(mk("div", "picktitle", kind === "acc" ? "Choose an accessory" : "Choose a hat"));
+                const grid = mk("div", "pickgrid");
+                const close = () => pick.remove();
+                const list = [{ id: 0, name: "None" }].concat(slotList(kind));
+                for (const h of list) {
+                    const t = mk("div", "ptile" + (h.id === cur ? " sel" : ""));
+                    if (h.id) { const img = mk("img"); img.src = slotImg(kind, h.id); img.alt = h.name; img.onerror = () => { img.style.visibility = "hidden"; }; t.appendChild(img); }
+                    else t.appendChild(mk("div", "pnone", "none"));
+                    t.appendChild(mk("div", "pcap", h.name));
+                    t.title = h.name + (h.desc ? " — " + h.desc : "");
+                    t.addEventListener("click", (e) => { e.stopPropagation(); onPick(h.id); close(); });
+                    grid.appendChild(t);
+                }
+                panel.appendChild(grid);
+                pick.appendChild(panel);
+                pick.addEventListener("mousedown", (e) => { e.stopPropagation(); if (e.target === pick) close(); });
+                gui.appendChild(pick);
+            }
+            // a captioned hat-slot + accessory-slot pair (insta slots, click combos)
+            function comboCell(label, getH, setH, getA, setA) {
+                const c = mk("div", "hatcell");
+                const pair = mk("div", "accpair");
+                pair.appendChild(hatSlot(getH, setH));            // hat
+                pair.appendChild(hatSlot(getA, setA, "acc"));     // accessory
+                c.appendChild(pair);
+                c.appendChild(mk("span", "hatcap", label));
+                return c;
+            }
+            function doGrab(e) {
+                const done = grab; grab = null; const el = grabEl; grabEl = null;
+                if (/^(Shift|Control|Alt|Meta|CapsLock|OS)$/.test(e.key)) { grab = done; grabEl = el; return; }
+                if (e.key === "Escape") { done(""); return; }
+                done(keyId(e));
+            }
+
+            // ---- rows + module card ----
+            function row(label, control) { const r = mk("div", "row"); r.appendChild(mk("span", "rl", label)); r.appendChild(control); return r; }
+            function sliderRow(label, min, max, step, get, set, fmt) {
+                const r = mk("div", "row srow"); r.appendChild(mk("span", "rl", label));
+                const s = smoothSlider(min, max, step, get, set, fmt); r.appendChild(s.input); r.appendChild(s.val); return r;
+            }
+            function modCard(title, master, wide) {
+                const card = mk("div", "mod" + (wide ? " wide" : ""));
+                const head = mk("div", "modhead"); head.appendChild(mk("span", "modtitle", title));
+                if (master) head.appendChild(toggleSwitch(master.get, master.set));
+                card.appendChild(head);
+                const body = mk("div", "modbody"); card.appendChild(body);
+                return { card, body };
+            }
+
+            // ---- modules / categories ----
+            const MODULES = {};
+            for (const s of SPAMMERS) {
+                const sid = s.id;
+                MODULES["spam_" + sid] = () => {
+                    const cfg = prefs.spammers[sid];
+                    const m = modCard(s.label, { get: () => cfg.on, set: (v) => { cfg.on = v; } });
+                    m.body.appendChild(row("Key", bindBtn(() => cfg.key, (id) => { cfg.key = id; })));
+                    m.body.appendChild(row("Item", textInput(() => cfg.item, (v) => { cfg.item = v || s.item; })));
+                    m.body.appendChild(sliderRow("Speed", 40, 500, 10, () => cfg.speed, (x) => { cfg.speed = x; }, (n) => n + "ms"));
+                    return m.card;
+                };
+            }
+            MODULES.humanize = () => {
+                const h = prefs.humanize;
+                const m = modCard("Humanize", { get: () => h.on, set: (v) => { h.on = v; } });
+                m.body.appendChild(sliderRow("Jitter", 0, 60, 1, () => h.jitter, (x) => { h.jitter = x; }, (n) => "±" + n + "%"));
+                m.body.appendChild(sliderRow("Pause %", 0, 25, 1, () => h.pauseChance, (x) => { h.pauseChance = x; }, (n) => n + "%"));
+                m.body.appendChild(sliderRow("Pause ms", 0, 600, 10, () => h.pauseMax, (x) => { h.pauseMax = x; }, (n) => n + "ms"));
+                return m.card;
+            };
+            MODULES.insta = () => {
+                const ik = prefs.insta;
+                const m = modCard("Instakill", null);
+                m.body.appendChild(row("Key", bindBtn(() => ik.key, (id) => { if (id) ik.key = id; })));
+                m.body.appendChild(row("Mode", selectBox([{ value: "packet", label: "Confirmed" }, { value: "timed", label: "Timed" }], () => ik.mode, (v) => { ik.mode = v; })));
+                m.body.appendChild(row("Auto aim", toggleSwitch(() => ik.autoAim, (v) => { ik.autoAim = v; })));
+                m.body.appendChild(row("Reverse (secondary first)", toggleSwitch(() => ik.reverse, (v) => { ik.reverse = v; })));
+                m.body.appendChild(row("Switch back", toggleSwitch(() => ik.switchBack, (v) => { ik.switchBack = v; })));
+                m.body.appendChild(sliderRow("Swap ms", 40, 300, 10, () => ik.swapDelay, (x) => { ik.swapDelay = x; }, (n) => n + "ms"));
+                const hats = mk("div", "hatrow");
+                hats.appendChild(comboCell("Primary", () => ik.primaryHat, (id) => { ik.primaryHat = id; }, () => ik.primaryAcc, (id) => { ik.primaryAcc = id; }));
+                hats.appendChild(comboCell("Secondary", () => ik.secondaryHat, (id) => { ik.secondaryHat = id; }, () => ik.secondaryAcc, (id) => { ik.secondaryAcc = id; }));
+                m.body.appendChild(hats);
+                return m.card;
+            };
+            function clickCard(title, cfg) {
+                const m = modCard(title, { get: () => cfg.on, set: (v) => { cfg.on = v; } });
+                const hold = mk("div", "hatrow");
+                hold.appendChild(comboCell("On hold", () => cfg.hat, (id) => { cfg.hat = id; }, () => cfg.acc, (id) => { cfg.acc = id; }));
+                m.body.appendChild(hold);
+                return m.card;
+            }
+            MODULES.clickLeft = () => clickCard("Left click", prefs.clicks.left);
+            MODULES.clickRight = () => clickCard("Right click", prefs.clicks.right);
+            MODULES.biomegear = () => {
+                const bg = prefs.biomegear;
+                const m = modCard("Biome gear", { get: () => bg.on, set: (v) => { bg.on = v; } });
+                const cell = (label, key) => {
+                    const c = mk("div", "hatcell");
+                    const pair = mk("div", "accpair");
+                    pair.appendChild(hatSlot(() => bg[key], (id) => { bg[key] = id; }));
+                    c.appendChild(pair);
+                    c.appendChild(mk("span", "hatcap", label));
+                    return c;
+                };
+                const hats = mk("div", "hatrow");
+                hats.appendChild(cell("Snow", "snow"));
+                hats.appendChild(cell("Normal", "normal"));
+                hats.appendChild(cell("River", "river"));
+                m.body.appendChild(hats);
+                return m.card;
+            };
+            MODULES.arrows = () => {
+                const a = prefs.arrows;
+                const m = modCard("Player arrows", { get: () => a.on, set: (v) => { a.on = v; applyArrows(); } });
+                m.body.appendChild(row("Players", toggleSwitch(() => a.players, (v) => { a.players = v; })));
+                m.body.appendChild(row("Animals", toggleSwitch(() => a.animals, (v) => { a.animals = v; })));
+                m.body.appendChild(row("Off-screen only", toggleSwitch(() => a.offscreen, (v) => { a.offscreen = v; })));
+                m.body.appendChild(sliderRow("Distance", 60, 220, 5, () => a.radius, (x) => { a.radius = x; }, (n) => n + "px"));
+                m.body.appendChild(sliderRow("Size", 8, 28, 1, () => a.size, (x) => { a.size = x; }, (n) => n + "px"));
+                return m.card;
+            };
+            MODULES.reloads = () => {
+                const r = prefs.reloads;
+                const m = modCard("Reload bars", { get: () => r.on, set: (v) => { r.on = v; applyReloads(); } });
+                m.body.appendChild(row("Yourself", toggleSwitch(() => r.self, (v) => { r.self = v; })));
+                m.body.appendChild(row("Enemies", toggleSwitch(() => r.enemies, (v) => { r.enemies = v; })));
+                return m.card;
+            };
+            MODULES.counter = () => {
+                const c = prefs.counter;
+                const m = modCard("Item counter", { get: () => c.on, set: (v) => { c.on = v; updateCounter(); } });
+                return m.card;
+            };
+            MODULES.minimap = () => {
+                const mm = prefs.minimap;
+                const m = modCard("Minimap", { get: () => mm.on, set: (v) => { mm.on = v; } });
+                m.body.appendChild(row("Placed items", toggleSwitch(() => mm.items, (v) => { mm.items = v; })));
+                m.body.appendChild(row("Trees", toggleSwitch(() => mm.trees, (v) => { mm.trees = v; })));
+                m.body.appendChild(row("Bushes", toggleSwitch(() => mm.bushes, (v) => { mm.bushes = v; })));
+                m.body.appendChild(row("Stones", toggleSwitch(() => mm.stones, (v) => { mm.stones = v; })));
+                m.body.appendChild(row("Gold", toggleSwitch(() => mm.gold, (v) => { mm.gold = v; })));
+                m.body.appendChild(row("Biomes", toggleSwitch(() => mm.biomes, (v) => { mm.biomes = v; })));
+                m.body.appendChild(row("Expand key", bindBtn(() => mm.key, (id) => { if (id) mm.key = id; })));
+                return m.card;
+            };
+            MODULES.heal = () => {
+                const h = prefs.heal;
+                const m = modCard("Auto heal", { get: () => h.on, set: (v) => { h.on = v; } });
+                m.body.appendChild(row("Legit mode", toggleSwitch(() => h.legit, (v) => { h.legit = v; })));
+                m.body.appendChild(row("Shame-safe", toggleSwitch(() => h.shameSafe, (v) => { h.shameSafe = v; })));
+                m.body.appendChild(sliderRow("Below", 1, 99, 1, () => h.healAt, (x) => { h.healAt = x; }, (n) => n + "%"));
+                m.body.appendChild(sliderRow("In hand", 0, 300, 10, () => h.showInHand, (x) => { h.showInHand = x; }, (n) => n + "ms"));
+                m.body.appendChild(sliderRow("Jitter", 0, 200, 10, () => h.jitter, (x) => { h.jitter = x; }, (n) => n + "ms"));
+                m.body.appendChild(sliderRow("Max/s", 1, 12, 1, () => h.maxPerSec, (x) => { h.maxPerSec = x; }, null));
+                return m.card;
+            };
+            MODULES.autogg = () => {
+                const g = prefs.autogg;
+                const m = modCard("Auto GG", { get: () => g.on, set: (v) => { g.on = v; } });
+                m.body.appendChild(row("Message", textInput(() => g.message, (v) => { g.message = v || "gg"; })));
+                return m.card;
+            };
+            MODULES.hats = () => {
+                const m = modCard("Hat keys", null, true);
+                const grid = mk("div", "hatrow");
+                prefs.hats.forEach((h) => {
+                    const c = mk("div", "hatcell");
+                    c.appendChild(hatSlot(() => h.id, (id) => { h.id = id; }));
+                    c.appendChild(bindBtn(() => h.key, (id) => { h.key = id; }));
+                    grid.appendChild(c);
+                });
+                m.body.appendChild(grid);
+                return m.card;
+            };
+            MODULES.general = () => {
+                const m = modCard("General", null, true);
+                m.body.appendChild(row("Menu key", bindBtn(() => prefs.menuKey, (id) => { if (id) prefs.menuKey = id; })));
+                const reset = mk("div", "btn", "Reset to defaults");
+                reset.addEventListener("click", () => {
+                    if (win.confirm && !win.confirm("Reset all MooMod settings?")) return;
+                    const d = JSON.parse(JSON.stringify(DEFAULTS));
+                    for (const k of Object.keys(prefs)) delete prefs[k];
+                    Object.assign(prefs, d);
+                    save();
+                    renderContent(contentEl);
+                });
+                m.body.appendChild(reset);
+                return m.card;
+            };
+            const CATEGORIES = [
+                { id: "placement", label: "Placement", mods: SPAMMERS.map((s) => "spam_" + s.id).concat(["humanize"]) },
+                { id: "combat", label: "Combat", mods: ["insta", "heal", "autogg"] },
+                { id: "clicks", label: "Clicks", mods: ["clickLeft", "clickRight"] },
+                { id: "visual", label: "Visual", mods: ["arrows", "reloads", "counter", "minimap"] },
+                { id: "hats", label: "Hats", mods: ["hats", "biomegear"] },
+                { id: "config", label: "Config", mods: ["general"] }
+            ];
+
+            function renderContent(content) {
+                if (!content) return;
+                content.textContent = "";
+                const cat = CATEGORIES.find((c) => c.id === activeCat) || CATEGORIES[0];
+                if (headTitle) headTitle.textContent = cat.label;
+                const grid = mk("div", "modgrid");
+                for (const id of cat.mods) { const b = MODULES[id]; if (b) grid.appendChild(b()); }
+                content.appendChild(grid);
+            }
+
+            function buildCard() {
+                const panel = mk("div", "mml-panel");
+                const side = mk("div", "side");
+                const brand = mk("div", "brand");
+                brand.appendChild(mk("span", "bname", "MooMod"));
+                side.appendChild(brand);
+                const nav = mk("div", "nav");
+                const navItems = {};
+                for (const c of CATEGORIES) {
+                    const it = mk("div", "navitem" + (c.id === activeCat ? " active" : ""));
+                    it.appendChild(mk("span", "ntxt", c.label));
+                    it.addEventListener("click", () => {
+                        activeCat = c.id;
+                        for (const k in navItems) navItems[k].classList.toggle("active", k === c.id);
+                        renderContent(contentEl);
+                    });
+                    navItems[c.id] = it; nav.appendChild(it);
+                }
+                side.appendChild(nav);
+                const user = mk("div", "user");
+                const ui = mk("div", "uinfo");
+                ui.appendChild(mk("span", "uname", "MooMod"));
+                ui.appendChild(mk("span", "uver", "menu · " + keyLabel(prefs.menuKey)));
+                user.appendChild(ui);
+                side.appendChild(user);
+                panel.appendChild(side);
+                const body = mk("div", "body");
+                const head = mk("div", "head");
+                headTitle = mk("span", "htitle", "Placement");
+                head.appendChild(headTitle);
+                const close = mk("div", "close", "✕"); close.addEventListener("click", closeMenu);
+                head.appendChild(close);
+                body.appendChild(head);
+                contentEl = mk("div", "content");
+                body.appendChild(contentEl);
+                panel.appendChild(body);
+                renderContent(contentEl);
+                return panel;
+            }
+
+            function build() {
+                if (built || !doc || !doc.body || !doc.head) return built;
+                const style = mk("style"); style.textContent = CSS; doc.head.appendChild(style);
+                gui = mk("div", "mml-gui");
+                gui.appendChild(buildCard());
+                gui.addEventListener("mousedown", (e) => { if (e.target === gui) closeMenu(); });   // click backdrop closes
+                doc.body.appendChild(gui);
+                built = true;
+                ctx.onCleanup(() => { style.remove(); gui.remove(); built = false; open = false; });
+                return true;
+            }
+            function openMenu() { if (!build()) return; open = true; gui.classList.add("open"); }
+            function closeMenu() { if (gui) { open = false; gui.classList.remove("open"); grab = null; grabEl = null; } }
+            function toggleMenu() { open ? closeMenu() : openMenu(); }
+            if (doc) (function wait() { if (!built) { build() || win.setTimeout(wait, 100); } })();
+
+            ctx.log("MooMod ready — press " + keyLabel(prefs.menuKey) + " for the menu");
+        });
+    }
+
+    // Fetch the loader's API through its event handshake — there is no window.MooMoo.
+    const w = (typeof unsafeWindow !== "undefined") ? unsafeWindow : window;
+    function connect() {
+        let mm = null, ld = null;
+        try { w.dispatchEvent(new CustomEvent("moomoo.js:api", { detail: { resolve: (m, l) => { mm = m; ld = l; } } })); } catch (e) {}
+        if (mm) { boot(mm, ld); return true; }
+        return false;
+    }
+    if (connect()) return;
+    let tries = 0;
+    const iv = setInterval(() => { if (connect() || ++tries > 200) clearInterval(iv); }, 50);
+    if (w.addEventListener) w.addEventListener("moomoo.js:ready", () => { if (connect()) clearInterval(iv); });
+})();
+

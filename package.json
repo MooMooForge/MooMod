@@ -1,0 +1,15 @@
+{
+  "name": "moomod",
+  "version": "1.3.1",
+  "description": "A clean, undetectable MooMoo.io mod — instakill, biome auto-gear, click hats, legit auto heal, place spammers, on-screen arrows, reload bars and a minimap, in one menu.",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/al007ex/MooMod.git"
+  },
+  "author": "al007ex",
+  "license": "MIT"
+}
