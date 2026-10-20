@@ -7,7 +7,7 @@
 // @match        *://*/*
 // @run-at       document-start
 // @inject-into  page
-// @require      https://pastebin.com/raw/jWDq3mmF?v=1.3.1
+// @require      https://update.greasyfork.org/scripts/600256/1966644/MooMoo-js.js
 // @grant        none
 // ==/UserScript==
 //
